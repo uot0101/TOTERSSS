@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # ====== بيانات البوت والإعدادات ======
 BOT_TOKEN = "8455353751:AAEx9Jla7H_BNPlkDvBPQQBeXdWI8LL9Fi0"
-MAX_CONCURRENT_TASKS = 100
+MAX_CONCURRENT_TASKS = 10  # تم تقليل القيمة من 100 إلى 10
 SESSION_TIMEOUT = 30 * 60  # 30 دقيقة من عدم النشاط
 
 # إنشاء thread pool للعمليات المتزامنة
@@ -326,6 +326,10 @@ class BotManager:
             chrome_options.add_argument('--allow-running-insecure-content')
             chrome_options.add_argument('--allow-cross-origin-auth-prompt')
             
+            # إضافة هذه الأسطر للتعامل مع بيئة النشر
+            chrome_options.add_argument('--remote-debugging-port=9222')
+            chrome_options.add_argument('--disable-setuid-sandbox')
+            
             self.driver = webdriver.Chrome(options=chrome_options)
             self.driver.set_page_load_timeout(60)  # 60 ثانية مهلة لتحميل الصفحة
             
@@ -535,6 +539,58 @@ def create_expired_user_options_keyboard(user_index, bot_manager):
         [InlineKeyboardButton("⬅️ رجوع", callback_data=f"expired_back_to_list_{user_index}")]
     ])
 
+# ====== دوال للحصول على معلومات المستخدم ======
+async def get_user_info_optimized(user_index, is_online, user_id):
+    """الحصول على معلومات المستخدم بشكل محسن"""
+    bot_manager = get_bot_manager(user_id)
+    
+    try:
+        # التحقق من وجود المعلومات في الذاكرة المؤقتة
+        cache_key = f"{user_index}_{is_online}"
+        if cache_key in bot_manager.info_cache:
+            return bot_manager.info_cache[cache_key]
+        
+        # الحصول على قائمة المستخدمين المناسبة
+        if is_online == "expired":
+            users_list = bot_manager.expired_users
+        elif is_online:
+            users_list = bot_manager.online_users
+        else:
+            users_list = bot_manager.offline_users
+        
+        # التحقق من وجود المستخدم
+        if user_index >= len(users_list):
+            return None
+        
+        user = users_list[user_index]
+        
+        # إذا كانت المعلومات موجودة بالفعل في القائمة، نعيدها مباشرة
+        if isinstance(user, dict) and all(key in user for key in ['name', 'phone', 'last_order', 'order_count', 'captain_wallet', 'full_name']):
+            bot_manager.info_cache[cache_key] = user
+            return user
+        
+        # إذا لم تكن المعلومات موجودة، نقوم بجلبها من الموقع
+        if not bot_manager.is_browser_ready or not bot_manager.driver:
+            return None
+        
+        # في هذه الحالة، نعيد المعلومات المتوفرة فقط
+        result = {
+            'name': user.get('name', 'غير متوفر'),
+            'phone': 'غير متوفر',
+            'last_order': 'غير متوفر',
+            'order_count': 'غير متوفر',
+            'captain_wallet': 'غير متوفر',
+            'full_name': 'غير متوفر'
+        }
+        
+        # حفظ النتيجة في الذاكرة المؤقتة
+        bot_manager.info_cache[cache_key] = result
+        return result
+        
+    except Exception as e:
+        logger.error(f"❌ خطأ في الحصول على معلومات المستخدم {user_index}: {e}")
+        return None
+
 # ====== معالجات البوت ======
 async def on_start(app):
     """الدالة التي تنفذ عند بدء تشغيل البوت"""
@@ -699,6 +755,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_manager.showing_online = False
         bot_manager.showing_offline = False
         bot_manager.showing_expired = False
+        keyboard = create_main_keyboard(bot_manager)
+        await query.edit_message_text(
+            text="✅ تم تسجيل الدخول بنجاح!",
+            reply_markup=keyboard
+        )
+    
+    elif query.data == "refresh_data":
+        # تحديث البيانات
+        await query.answer("🔄 جاري تحديث البيانات...")
+        
+        # إعادة تعيين الحالة
+        bot_manager.reset_state()
+        
+        # العودة إلى القائمة الرئيسية مع تحديث الأعداد
         keyboard = create_main_keyboard(bot_manager)
         await query.edit_message_text(
             text="✅ تم تسجيل الدخول بنجاح!",
@@ -1176,777 +1246,113 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard
         )
     
-    elif query.data == "refresh_data":
-        # تحديث البيانات
-        await query.answer("🔄 جاري تحديث البيانات...")
+    return ConversationHandler.END
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج الرسائل النصية"""
+    user_id = update.effective_user.id
+    bot_manager = get_bot_manager(user_id)
+    
+    # تحديث وقت النشاط
+    bot_manager.last_activity = time.time()
+    
+    text = update.message.text
+    
+    # التحقق من أن المستخدم في حالة تسجيل الدخول
+    if bot_manager.email_msg_id is not None:
+        # تخزين الإيميل
+        bot_manager.username = text
         
-        # إرسال رسالة انتظار
-        waiting_msg = await query.message.reply_text("⏳ جاري تحديث البيانات من الموقع، يرجى الانتظار...")
+        # حذف رسالة طلب الإيميل
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=bot_manager.email_msg_id)
+        except Exception as e:
+            logger.error(f"خطأ في حذف رسالة طلب الإيميل للمستخدم {user_id}: {e}")
         
-        # تنفيذ عملية التحديث
-        success = await refresh_user_data(user_id)
+        # إرسال رسالة طلب كلمة المرور
+        password_msg = await update.message.reply_text(
+            text="🔐 يرجى إرسال كلمة المرور الخاصة بك:"
+        )
+        bot_manager.password_msg_id = password_msg.message_id
+        bot_manager.email_msg_id = None
+        
+        return PASSWORD
+    
+    elif bot_manager.password_msg_id is not None:
+        # تخزين كلمة المرور
+        bot_manager.password = text
+        
+        # حذف رسالة طلب كلمة المرور
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=bot_manager.password_msg_id)
+        except Exception as e:
+            logger.error(f"خطأ في حذف رسالة طلب كلمة المرور للمستخدم {user_id}: {e}")
+        
+        # إرسال رسالة انتظار لتسجيل الدخول
+        login_process_msg = await update.message.reply_text(
+            text="🔄 جاري تسجيل الدخول...\nيرجى الانتظار"
+        )
+        bot_manager.login_process_msg_id = login_process_msg.message_id
+        bot_manager.password_msg_id = None
+        
+        # تسجيل الدخول في خيط منفصل
+        loop = asyncio.get_event_loop()
+        login_success = await loop.run_in_executor(executor, bot_manager.login_to_site)
         
         # حذف رسالة الانتظار
         try:
-            await context.bot.delete_message(chat_id=user_id, message_id=waiting_msg.message_id)
+            await context.bot.delete_message(chat_id=user_id, message_id=bot_manager.login_process_msg_id)
         except Exception as e:
             logger.error(f"خطأ في حذف رسالة الانتظار للمستخدم {user_id}: {e}")
         
-        if success:
+        if login_success:
+            # إرسال رسالة تأكيد مع القائمة الرئيسية
             keyboard = create_main_keyboard(bot_manager)
-            await query.edit_message_text(
-                text="✅ تم تحديث البيانات بنجاح!",
+            await update.message.reply_text(
+                text="✅ تم تسجيل الدخول بنجاح!",
                 reply_markup=keyboard
             )
         else:
-            await query.answer("❌ فشل في تحديث البيانات", show_alert=True)
-            # إعادة عرض القائمة الرئيسية مع البيانات القديمة
-            keyboard = create_main_keyboard(bot_manager)
-            await query.edit_message_text(
-                text="⚠️ فشل تحديث البيانات، يتم عرض البيانات المخزنة مسبقاً",
-                reply_markup=keyboard
+            await update.message.reply_text(
+                text="❌ فشل في تسجيل الدخول. يرجى التحقق من بيانات الاعتماد والمحاولة مرة أخرى"
             )
-    
-    return ConversationHandler.END
-
-async def get_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج الحصول على اسم المستخدم"""
-    user_id = update.effective_user.id
-    bot_manager = get_bot_manager(user_id)
-    
-    username = update.message.text.strip()
-    bot_manager.username = username
-    
-    # حذف رسالة طلب الإيميل
-    try:
-        await context.bot.delete_message(chat_id=user_id, message_id=bot_manager.email_msg_id)
-    except Exception as e:
-        logger.error(f"خطأ في حذف رسالة طلب الإيميل للمستخدم {user_id}: {e}")
-    
-    # إرسال رسالة طلب كلمة المرور
-    password_msg = await update.message.reply_text(
-        text=f"✅ تم حفظ الإيميل: {username}\n\n🔒 يرجى إرسال كلمة المرور:"
-    )
-    bot_manager.password_msg_id = password_msg.message_id
-    return PASSWORD
-
-async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج الحصول على كلمة المرور"""
-    user_id = update.effective_user.id
-    bot_manager = get_bot_manager(user_id)
-    
-    if not bot_manager.username:
-        await update.message.reply_text("❌ لم يتم حفظ الإيميل. يرجى البدء من جديد")
+        
         return ConversationHandler.END
     
-    password = update.message.text
-    bot_manager.password = password
-    
-    # حذف رسالة طلب كلمة المرور
-    try:
-        await context.bot.delete_message(chat_id=user_id, message_id=bot_manager.password_msg_id)
-    except Exception as e:
-        logger.error(f"خطأ في حذف رسالة طلب كلمة المرور للمستخدم {user_id}: {e}")
-    
-    # التحقق من أن المتصفح جاهز
-    if not bot_manager.is_browser_ready:
-        await update.message.reply_text("❌ المتصفح غير جاهز. يرجى إعادة تشغيل البوت")
-        return ConversationHandler.END
-    
-    # إرسال رسالة بدء عملية تسجيل الدخول
-    login_process_msg = await update.message.reply_text(
-        text="🔐 جاري محاولة تسجيل الدخول...\n\n1. جاري البحث عن حقل الإيميل\n2. جاري إدخال الإيميل\n3. جاري البحث عن حقل كلمة المرور\n4. جاري إدخال كلمة المرور\n5. جاري النقر على زر تسجيل الدخول\n6. جاري التحقق من نجاح التسجيل"
+    # رسالة غير معروفة
+    await update.message.reply_text(
+        text="❌ لم يتم فهم الرسالة. يرجى استخدام الأزرار المتاحة."
     )
-    bot_manager.login_process_msg_id = login_process_msg.message_id
-    
-    # محاولة تسجيل الدخول
-    result = await perform_login(
-        bot_manager.username, 
-        password, 
-        user_id
-    )
-    
-    # حذف رسالة عملية تسجيل الدخول
-    try:
-        await context.bot.delete_message(chat_id=user_id, message_id=bot_manager.login_process_msg_id)
-    except Exception as e:
-        logger.error(f"خطأ في حذف رسالة عملية التسجيل للمستخدم {user_id}: {e}")
-    
-    if result['success']:
-        # جلب بيانات المستخدمين
-        await refresh_user_data(user_id)
-        
-        # إرسال رسالة النجاح مع الأزرار
-        keyboard = create_main_keyboard(bot_manager)
-        await update.message.reply_text(
-            text="✅ تم تسجيل الدخول بنجاح!",
-            reply_markup=keyboard
-        )
-    else:
-        # إرسال رسالة الفشل
-        error_msg = result.get('message', 'فشل تسجيل الدخول')
-        keyboard = [[InlineKeyboardButton("🔄 حاول مرة أخرى", callback_data="start_pressed")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await update.message.reply_text(
-            text=f"❌ فشل تسجيل الدخول: {error_msg}",
-            reply_markup=reply_markup
-        )
-    
-    return ConversationHandler.END
 
-# ====== دوال تسجيل الدخول ======
-async def perform_login(username, password, user_id):
-    """أداء عملية تسجيل الدخول مع تحسين الأداء"""
-    bot_manager = get_bot_manager(user_id)
-    
-    if not bot_manager.is_browser_ready or not bot_manager.driver:
-        return {'success': False, 'message': 'المتصفح غير جاهز'}
-    
-    try:
-        # استخدام partial لتمرير المعلمات مع الدالة
-        login_task = partial(_perform_login_sync, bot_manager, username, password)
-        
-        # تشغيل المهمة في الـ executor
-        result = await asyncio.get_event_loop().run_in_executor(executor, login_task)
-        return result
-    except Exception as e:
-        logger.error(f"❌ خطأ غير متوقع في عملية التسجيل للمستخدم {user_id}: {e}")
-        return {'success': False, 'message': f'خطأ تقني: {str(e)}'}
-
-def _perform_login_sync(bot_manager, username, password):
-    """النسخة المتزامنة من عملية تسجيل الدخول لتشغيلها في thread منفصل"""
-    try:
-        driver = bot_manager.driver
-        
-        # الانتقال إلى صفحة التسجيل
-        driver.get("https://merchant.totersapp.com/#/")
-        
-        # انتظار تحميل الصفحة بشكل كامل
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        time.sleep(3)  # انتظار إضافي لضمان تحميل جميع العناصر
-        
-        # البحث عن حقل الإيميل بطرق متعددة
-        email_field = None
-        try:
-            # الطريقة الأولى: البحث بالـ XPATH
-            email_field = WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.XPATH, "//input[@type='email' or @ng-model='vm.user.email']"))
-            )
-            logger.info(f"✅ تم العثور على حقل الإيميل بالطريقة الأولى للمستخدم {bot_manager.user_id}")
-        except:
-            try:
-                # الطريقة الثانية: البحث بالـ CSS Selector
-                email_field = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email']"))
-                )
-                logger.info(f"✅ تم العثور على حقل الإيميل بالطريقة الثانية للمستخدم {bot_manager.user_id}")
-            except:
-                try:
-                    # الطريقة الثالثة: البحث بالـ Name
-                    email_field = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.NAME, "email"))
-                    )
-                    logger.info(f"✅ تم العثور على حقل الإيميل بالطريقة الثالثة للمستخدم {bot_manager.user_id}")
-                except:
-                    try:
-                        # الطريقة الرابعة: البحث بالـ ID
-                        email_field = WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.ID, "email"))
-                        )
-                        logger.info(f"✅ تم العثور على حقل الإيميل بالطريقة الرابعة للمستخدم {bot_manager.user_id}")
-                    except:
-                        pass
-        
-        if not email_field:
-            logger.error(f"❌ تعذر العثور على حقل الإيميل للمستخدم {bot_manager.user_id}")
-            return {'success': False, 'message': 'تعذر العثور على حقل الإيميل'}
-        
-        # التأكد من أن حقل الإيميل مرئي وقابل للتفاعل
-        WebDriverWait(driver, 10).until(
-            EC.visibility_of(email_field)
-        )
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable(email_field)
-        )
-        
-        # مسح حقل الإيميل وإدخال البريد الإلكتروني
-        email_field.clear()
-        email_field.click()
-        email_field.send_keys(username)
-        logger.info(f"✅ تم إدخال الإيميل للمستخدم {bot_manager.user_id}")
-        
-        # انتظار قصير قبل البحث عن حقل كلمة المرور
-        time.sleep(1)
-        
-        # البحث عن حقل كلمة المرور بطرق متعددة
-        password_field = None
-        try:
-            # الطريقة الأولى: البحث بالـ XPATH
-            password_field = WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.XPATH, "//input[@type='password' or @ng-model='vm.user.password']"))
-            )
-            logger.info(f"✅ تم العثور على حقل كلمة المرور بالطريقة الأولى للمستخدم {bot_manager.user_id}")
-        except:
-            try:
-                # الطريقة الثانية: البحث بالـ CSS Selector
-                password_field = WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']"))
-                )
-                logger.info(f"✅ تم العثور على حقل كلمة المرور بالطريقة الثانية للمستخدم {bot_manager.user_id}")
-            except:
-                try:
-                    # الطريقة الثالثة: البحث بالـ Name
-                    password_field = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located((By.NAME, "password"))
-                    )
-                    logger.info(f"✅ تم العثور على حقل كلمة المرور بالطريقة الثالثة للمستخدم {bot_manager.user_id}")
-                except:
-                    try:
-                        # الطريقة الرابعة: البحث بالـ ID
-                        password_field = WebDriverWait(driver, 10).until(
-                            EC.presence_of_element_located((By.ID, "password"))
-                        )
-                        logger.info(f"✅ تم العثور على حقل كلمة المرور بالطريقة الرابعة للمستخدم {bot_manager.user_id}")
-                    except:
-                        pass
-        
-        if not password_field:
-            logger.error(f"❌ تعذر العثور على حقل كلمة المرور للمستخدم {bot_manager.user_id}")
-            return {'success': False, 'message': 'تعذر العثور على حقل كلمة المرور'}
-        
-        # التأكد من أن حقل كلمة المرور مرئي وقابل للتفاعل
-        WebDriverWait(driver, 10).until(
-            EC.visibility_of(password_field)
-        )
-        WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable(password_field)
-        )
-        
-        # مسح حقل كلمة المرور وإدخال كلمة المرور
-        password_field.clear()
-        password_field.click()
-        password_field.send_keys(password)
-        logger.info(f"✅ تم إدخال كلمة المرور للمستخدم {bot_manager.user_id}")
-        
-        # انتظار قصير قبل البحث عن زر تسجيل الدخول
-        time.sleep(1)
-        
-        # البحث عن زر تسجيل الدخول بطرق متعددة
-        login_button = None
-        try:
-            # الطريقة الأولى: البحث بالـ XPATH
-            login_button = WebDriverWait(driver, 15).until(
-                EC.element_to_be_clickable((By.XPATH, "//button[@type='submit']"))
-            )
-            logger.info(f"✅ تم العثور على زر تسجيل الدخول بالطريقة الأولى للمستخدم {bot_manager.user_id}")
-        except:
-            try:
-                # الطريقة الثانية: البحث بالـ CSS Selector
-                login_button = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button[type='submit']"))
-                )
-                logger.info(f"✅ تم العثور على زر تسجيل الدخول بالطريقة الثانية للمستخدم {bot_manager.user_id}")
-            except:
-                try:
-                    # الطريقة الثالثة: البحث عن نص Login أو Sign In
-                    login_button = WebDriverWait(driver, 10).until(
-                        EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Login') or contains(text(), 'Sign In')]"))
-                    )
-                    logger.info(f"✅ تم العثور على زر تسجيل الدخول بالطريقة الثالثة للمستخدم {bot_manager.user_id}")
-                except:
-                    try:
-                        # الطريقة الرابعة: البحث بالـ ID
-                        login_button = WebDriverWait(driver, 10).until(
-                            EC.element_to_be_clickable((By.ID, "login-button"))
-                        )
-                        logger.info(f"✅ تم العثور على زر تسجيل الدخول بالطريقة الرابعة للمستخدم {bot_manager.user_id}")
-                    except:
-                        try:
-                            # الطريقة الخامسة: البحث بالـ Class
-                            login_button = WebDriverWait(driver, 10).until(
-                                EC.element_to_be_clickable((By.CLASS_NAME, "login-button"))
-                            )
-                            logger.info(f"✅ تم العثور على زر تسجيل الدخول بالطريقة الخامسة للمستخدم {bot_manager.user_id}")
-                        except:
-                            pass
-        
-        if not login_button:
-            logger.error(f"❌ تعذر العثور على زر التسجيل للمستخدم {bot_manager.user_id}")
-            return {'success': False, 'message': 'تعذر العثور على زر التسجيل'}
-        
-        # التأكد من أن زر تسجيل الدخول مرئي وقابل للنقر
-        WebDriverWait(driver, 10).until(
-            EC.visibility_of(login_button)
-        )
-        
-        # النقر على زر تسجيل الدخول
-        login_button.click()
-        logger.info(f"✅ تم النقر على زر تسجيل الدخول للمستخدم {bot_manager.user_id}")
-        
-        # الانتظار للتحقق من نجاح التسجيل
-        time.sleep(5)
-        
-        # التحقق من وجود عناصر تدل على نجاح التسجيل بطرق متعددة
-        success = False
-        
-        # الطريقة الأولى: البحث عن نص Online أو Offline
-        try:
-            WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Online') or contains(text(), 'Offline')]"))
-            )
-            success = True
-            logger.info(f"✅ تم التحقق من تسجيل الدخول بالطريقة الأولى للمستخدم {bot_manager.user_id}")
-        except:
-            pass
-        
-        # الطريقة الثانية: البحث عن عنصر لوحة التحكم
-        if not success:
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.XPATH, "//*[contains(@class, 'dashboard') or contains(@class, 'main')]"))
-                )
-                success = True
-                logger.info(f"✅ تم التحقق من تسجيل الدخول بالطريقة الثانية للمستخدم {bot_manager.user_id}")
-            except:
-                pass
-        
-        # الطريقة الثالثة: التحقق من تغيير URL
-        if not success:
-            try:
-                current_url = driver.current_url
-                if "dashboard" in current_url or "home" in current_url or "main" in current_url:
-                    success = True
-                    logger.info(f"✅ تم التحقق من تسجيل الدخول بالطريقة الثالثة للمستخدم {bot_manager.user_id}")
-            except:
-                pass
-        
-        # الطريقة الرابعة: البحث عن رسالة ترحيب
-        if not success:
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Welcome') or contains(text(), 'مرحبا')]"))
-                )
-                success = True
-                logger.info(f"✅ تم التحقق من تسجيل الدخول بالطريقة الرابعة للمستخدم {bot_manager.user_id}")
-            except:
-                pass
-        
-        if success:
-            logger.info(f"✅ تم تسجيل الدخول بنجاح للمستخدم {bot_manager.user_id}")
-            return {'success': True}
-        else:
-            logger.error(f"❌ فشل التحقق من تسجيل الدخول للمستخدم {bot_manager.user_id}")
-            return {'success': False, 'message': 'فشل التحقق من تسجيل الدخول'}
-            
-    except Exception as e:
-        logger.error(f"❌ خطأ غير متوقع في عملية التسجيل المتزامنة للمستخدم {bot_manager.user_id}: {e}")
-        return {'success': False, 'message': str(e)}
-    finally:
-        # تأكد من أن المتصفح لا يزال في حالة جيدة
-        if bot_manager.driver:
-            try:
-                # تحقق من أن الصفحة لا تزال محملة
-                _ = bot_manager.driver.current_url
-            except:
-                logger.warning(f"⚠️ المتصفح في حالة غير مستقرة للمستخدم {bot_manager.user_id}")
-                try:
-                    bot_manager.close_browser()
-                    bot_manager.init_browser()
-                except Exception as e:
-                    logger.error(f"❌ فشل في إعادة تهيئة المتصفح للمستخدم {bot_manager.user_id}: {e}")
-
-# ====== دوال تحديث البيانات ======
-async def refresh_page_safely(driver, user_id):
-    """تحديث الصفحة بشكل آمن مع معالجة الأخطاء"""
-    try:
-        logger.info(f"🔄 جاري تحديث الصفحة للمستخدم {user_id}")
-        driver.refresh()
-        
-        # انتظار تحميل الصفحة
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        
-        # انتظار إضافي لضمان تحميل جميع العناصر الديناميكية
-        time.sleep(3)
-        
-        logger.info(f"✅ تم تحديث الصفحة بنجاح للمستخدم {user_id}")
-        return True
-    except TimeoutException:
-        logger.error(f"❌ انتهت مهلة تحميل الصفحة للمستخدم {user_id}")
-        return False
-    except WebDriverException as e:
-        logger.error(f"❌ خطأ في المتصفح أثناء تحديث الصفحة للمستخدم {user_id}: {e}")
-        return False
-    except Exception as e:
-        logger.error(f"❌ خطأ غير متوقع أثناء تحديث الصفحة للمستخدم {user_id}: {e}")
-        return False
-
-async def refresh_user_data(user_id):
-    """تحديث بيانات المستخدمين مع تحديث البيانات المخزنة فقط"""
-    try:
-        bot_manager = get_bot_manager(user_id)
-        
-        if not bot_manager.is_browser_ready or not bot_manager.driver:
-            return False
-        
-        driver = bot_manager.driver
-        
-        # تحديث الصفحة أولاً
-        try:
-            logger.info(f"🔄 جاري تحديث الصفحة للمستخدم {user_id}")
-            driver.refresh()
-            WebDriverWait(driver, 30).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            time.sleep(3)  # انتظار إضافي لضمان تحميل جميع العناصر
-        except Exception as e:
-            logger.error(f"❌ خطأ في تحديث الصفحة للمستخدم {user_id}: {e}")
-            return False
-        
-        # محاولة جلب البيانات مع إعادة المحاولة
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                # جلب عدد المستخدمين المتصلين وغير المتصلين مع تحديث البيانات المخزنة
-                success_online = await fetch_online_users(user_id)
-                success_offline = await fetch_offline_users(user_id)
-                
-                if success_online and success_offline:
-                    return True
-                else:
-                    logger.warning(f"⚠️ محاولة {attempt + 1} فشلت في جلب البيانات للمستخدم {user_id}")
-                    if attempt < max_retries - 1:
-                        time.sleep(2)  # انتظار قبل إعادة المحاولة
-                        driver.refresh()  # تحديث الصفحة مرة أخرى
-                        WebDriverWait(driver, 30).until(
-                            EC.presence_of_element_located((By.TAG_NAME, "body"))
-                        )
-                        time.sleep(2)
-            except Exception as e:
-                logger.error(f"❌ خطأ في محاولة {attempt + 1} لجلب البيانات للمستخدم {user_id}: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(2)
-        
-        logger.error(f"❌ فشلت جميع محاولات تحديث البيانات للمستخدم {user_id}")
-        return False
-    except Exception as e:
-        logger.error(f"❌ خطأ في تحديث بيانات المستخدمين للمستخدم {user_id}: {e}")
-        return False
-
-async def fetch_online_users(user_id):
-    """جلب قائمة المستخدمين المتصلين مع تخزين البيانات الكاملة"""
-    try:
-        bot_manager = get_bot_manager(user_id)
-        
-        if not bot_manager.is_browser_ready or not bot_manager.driver:
-            return False
-        
-        driver = bot_manager.driver
-        
-        # البحث عن عنصر Online والنقر عليه
-        online_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Online')]")
-        if online_elements:
-            try:
-                # الانتظار حتى يصبح العنصر قابلاً للنقر
-                WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Online')]"))
-                )
-                
-                # استخدام JavaScript للنقر (يتجاوز العناصر المعترضة)
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", online_elements[0])
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", online_elements[0])
-                
-                # الانتظار حتى تظهر قائمة المستخدمين
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.XPATH, "//h3[contains(@class, 'ng-binding')]"))
-                )
-                
-                # انتظار إضافي لضمان تحميل جميع العناصر
-                time.sleep(2)
-            except Exception as e:
-                logger.error(f"❌ خطأ في النقر على عنصر Online للمستخدم {user_id}: {e}")
-                return False
-        
-        # جلب عناصر المستخدمين المتصلين
-        user_elements = driver.find_elements(By.XPATH, "//span[contains(@class, 'dot-50')]/ancestor::div[contains(@class, 'md-list-item-text')]")
-        
-        # قائمة مؤقتة للمستخدمين المتصلين الجدد
-        temp_online_users = []
-        
-        for element in user_elements:
-            try:
-                # استخراج اسم المستخدم
-                name_element = element.find_element(By.XPATH, ".//h3[contains(@class, 'ng-binding')]")
-                name = name_element.text.strip()
-                
-                # التحقق من أن المستخدم ليس في قائمة منتهي الصلاحية
-                is_expired = False
-                for expired_user in bot_manager.expired_users:
-                    if expired_user.get('name') == name:
-                        is_expired = True
-                        break
-                
-                if is_expired:
-                    continue  # تخطي المستخدم إذا كان منتهي الصلاحية
-                
-                # استخراج الاسم الكامل (بدون كلمة free)
-                full_name = re.sub(r'\s*free\s*$', '', name, flags=re.IGNORECASE).strip()
-                
-                # استخراج رقم الهاتف
-                try:
-                    phone_element = element.find_element(By.XPATH, ".//a[contains(@href, 'tel:')]")
-                    phone = phone_element.text.strip()
-                except:
-                    phone = 'غير متوفر'
-                
-                # استخراج تاريخ آخر طلب
-                try:
-                    last_order_element = element.find_element(By.XPATH, ".//p[contains(text(), 'Last order delivered')]")
-                    last_order = last_order_element.text.replace('Last order delivered: ', '').strip()
-                except:
-                    last_order = 'غير متوفر'
-                
-                # استخراج عدد الطلبات
-                try:
-                    order_count_element = element.find_element(By.XPATH, ".//p[contains(text(), 'Orders delivered today')]")
-                    order_count = order_count_element.text.replace('Orders delivered today: ', '').strip()
-                except:
-                    order_count = 'غير متوفر'
-                
-                # استخراج محفظة الكابتن
-                try:
-                    wallet_element = element.find_element(By.XPATH, ".//p[contains(text(), 'Payments wallet')]")
-                    wallet = wallet_element.text.replace('Payments wallet: ', '').strip()
-                except:
-                    wallet = 'غير متوفر'
-                
-                if name:  # التأكد من أن الاسم ليس فارغًا
-                    temp_online_users.append({
-                        'name': name,
-                        'full_name': full_name,
-                        'phone': phone,
-                        'last_order': last_order,
-                        'order_count': order_count,
-                        'captain_wallet': wallet
-                    })
-            except Exception as e:
-                logger.error(f"خطأ في استخراج بيانات مستخدم متصل: {e}")
-        
-        # تحديث قائمة المستخدمين المتصلين
-        bot_manager.online_users = temp_online_users
-        
-        # الحصول على العدد من النص إذا أمكن
-        if online_elements:
-            online_text = online_elements[0].text
-            numbers = re.findall(r'\((\d+)\)', online_text)
-            if numbers:
-                bot_manager.online_count = int(numbers[0])
-            else:
-                bot_manager.online_count = len(bot_manager.online_users)
-        else:
-            bot_manager.online_count = len(bot_manager.online_users)
-        
-        # التحقق من صحة البيانات
-        if bot_manager.online_count == 0 and len(bot_manager.online_users) == 0:
-            logger.warning(f"لم يتم العثور على مستخدمين متصلين للمستخدم {user_id}")
-        
-        return True
-    except Exception as e:
-        logger.error(f"خطأ في جلب المستخدمين المتصلين للمستخدم {user_id}: {e}")
-        return False
-
-async def fetch_offline_users(user_id):
-    """جلب قائمة المستخدمين غير المتصلين مع تخزين البيانات الكاملة"""
-    try:
-        bot_manager = get_bot_manager(user_id)
-        
-        if not bot_manager.is_browser_ready or not bot_manager.driver:
-            return False
-        
-        driver = bot_manager.driver
-        
-        # البحث عن عنصر Offline والنقر عليه
-        offline_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Offline')]")
-        if offline_elements:
-            try:
-                # الانتظار حتى يصبح العنصر قابلاً للنقر
-                WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Offline')]"))
-                )
-                
-                # استخدام JavaScript للنقر (يتجاوز العناصر المعترضة)
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", offline_elements[0])
-                time.sleep(0.5)
-                driver.execute_script("arguments[0].click();", offline_elements[0])
-                
-                # الانتظار حتى تظهر قائمة المستخدمين
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.XPATH, "//h3[contains(@class, 'ng-binding')]"))
-                )
-                
-                # انتظار إضافي لضمان تحميل جميع العناصر
-                time.sleep(2)
-            except Exception as e:
-                logger.error(f"❌ خطأ في النقر على عنصر Offline للمستخدم {user_id}: {e}")
-                return False
-        
-        # جلب عناصر المستخدمين غير المتصلين
-        user_elements = driver.find_elements(By.XPATH, "//span[contains(@class, 'dot-40')]/ancestor::div[contains(@class, 'md-list-item-text')]")
-        
-        # قائمة مؤقتة للمستخدمين غير المتصلين الجدد
-        temp_offline_users = []
-        
-        for element in user_elements:
-            try:
-                # استخراج اسم المستخدم
-                name_element = element.find_element(By.XPATH, ".//h3[contains(@class, 'ng-binding')]")
-                name = name_element.text.strip()
-                
-                # التحقق من أن المستخدم ليس في قائمة منتهي الصلاحية
-                is_expired = False
-                for expired_user in bot_manager.expired_users:
-                    if expired_user.get('name') == name:
-                        is_expired = True
-                        break
-                
-                if is_expired:
-                    continue  # تخطي المستخدم إذا كان منتهي الصلاحية
-                
-                # استخراج الاسم الكامل (بدون كلمة free)
-                full_name = re.sub(r'\s*free\s*$', '', name, flags=re.IGNORECASE).strip()
-                
-                # استخراج رقم الهاتف
-                try:
-                    phone_element = element.find_element(By.XPATH, ".//a[contains(@href, 'tel:')]")
-                    phone = phone_element.text.strip()
-                except:
-                    phone = 'غير متوفر'
-                
-                # استخراج تاريخ آخر طلب
-                try:
-                    last_order_element = element.find_element(By.XPATH, ".//p[contains(text(), 'Last order delivered')]")
-                    last_order = last_order_element.text.replace('Last order delivered: ', '').strip()
-                except:
-                    last_order = 'غير متوفر'
-                
-                # استخراج عدد الطلبات
-                try:
-                    order_count_element = element.find_element(By.XPATH, ".//p[contains(text(), 'Orders delivered today')]")
-                    order_count = order_count_element.text.replace('Orders delivered today: ', '').strip()
-                except:
-                    order_count = 'غير متوفر'
-                
-                # استخراج محفظة الكابتن
-                try:
-                    wallet_element = element.find_element(By.XPATH, ".//p[contains(text(), 'Payments wallet')]")
-                    wallet = wallet_element.text.replace('Payments wallet: ', '').strip()
-                except:
-                    wallet = 'غير متوفر'
-                
-                if name:  # التأكد من أن الاسم ليس فارغًا
-                    temp_offline_users.append({
-                        'name': name,
-                        'full_name': full_name,
-                        'phone': phone,
-                        'last_order': last_order,
-                        'order_count': order_count,
-                        'captain_wallet': wallet
-                    })
-            except Exception as e:
-                logger.error(f"خطأ في استخراج بيانات مستخدم غير متصل: {e}")
-        
-        # تحديث قائمة المستخدمين غير المتصلين
-        bot_manager.offline_users = temp_offline_users
-        
-        # الحصول على العدد من النص إذا أمكن
-        if offline_elements:
-            offline_text = offline_elements[0].text
-            numbers = re.findall(r'\((\d+)\)', offline_text)
-            if numbers:
-                bot_manager.offline_count = int(numbers[0])
-            else:
-                bot_manager.offline_count = len(bot_manager.offline_users)
-        else:
-            bot_manager.offline_count = len(bot_manager.offline_users)
-        
-        # التحقق من صحة البيانات
-        if bot_manager.offline_count == 0 and len(bot_manager.offline_users) == 0:
-            logger.warning(f"لم يتم العثور على مستخدمين غير متصلين للمستخدم {user_id}")
-        
-        return True
-    except Exception as e:
-        logger.error(f"خطأ في جلب المستخدمين غير المتصلين للمستخدم {user_id}: {e}")
-        return False
-
-async def get_user_info_optimized(index, user_type, user_id):
-    """الحصول على معلومات مستخدم معين من البيانات المخزنة"""
-    try:
-        bot_manager = get_bot_manager(user_id)
-        
-        # تحديد نوع المستخدم (متصل/غير متصل/منتهي الصلاحية)
-        if user_type == True or user_type == "online":
-            users = bot_manager.online_users
-            status_text = "Online"
-        elif user_type == False or user_type == "offline":
-            users = bot_manager.offline_users
-            status_text = "Offline"
-        elif user_type == "expired":
-            users = bot_manager.expired_users
-            status_text = "منتهي الصلاحية"
-        else:
-            return None
-        
-        # التأكد من أن الفهرس صحيح
-        if index < 0 or index >= len(users):
-            return None
-        
-        # استرجاع معلومات المستخدم من البيانات المخزنة
-        user_info = users[index].copy()
-        user_info['details'] = f'مستخدم {status_text} - تم الجلب في {datetime.now().strftime("%H:%M:%S")}'
-        
-        return user_info
-        
-    except Exception as e:
-        logger.error(f"خطأ في جلب معلومات المستخدم للمستخدم {user_id}: {e}")
-        return None
-
-# ====== دوال التنظيف والجدولة ======
+# ====== دوال مساعدة إضافية ======
 def start_cleanup_scheduler():
     """بدء مجدول تنظيف الجلسات غير النشطة"""
-    def cleanup_sessions():
-        with session_lock:
-            current_time = time.time()
-            expired_users = []
-            
-            for user_id, bot_manager in users_data.items():
-                if current_time - bot_manager.last_activity > SESSION_TIMEOUT:
-                    expired_users.append(user_id)
-            
-            for user_id in expired_users:
-                try:
-                    bot_manager = users_data[user_id]
-                    bot_manager.close_browser()
-                    bot_manager.reset_state()
-                    del users_data[user_id]
-                    logger.info(f"✅ تم تنظيف جلسة المستخدم {user_id} بسبب عدم النشاط")
-                except Exception as e:
-                    logger.error(f"❌ خطأ في تنظيف جلسة المستخدم {user_id}: {e}")
-    
-    # تشغيل المجدول كل 5 دقائق
     import threading
-    def scheduler():
-        while True:
-            time.sleep(300)  # 5 دقائق
-            cleanup_sessions()
     
-    scheduler_thread = threading.Thread(target=scheduler, daemon=True)
-    scheduler_thread.start()
+    def cleanup_sessions():
+        """تنظيف الجلسات غير النشطة"""
+        while True:
+            time.sleep(60 * 5)  # التحقق كل 5 دقائق
+            
+            current_time = time.time()
+            with session_lock:
+                # إنشاء قائمة من معرفات المستخدمين الذين تم انتهاء جلساتهم
+                expired_sessions = []
+                for user_id, bot_manager in users_data.items():
+                    if current_time - bot_manager.last_activity > SESSION_TIMEOUT:
+                        expired_sessions.append(user_id)
+                
+                # إغلاق الجلسات المنتهية
+                for user_id in expired_sessions:
+                    logger.info(f"🧹 تنظيف جلسة المستخدم {user_id} بسبب عدم النشاط")
+                    users_data[user_id].close_browser()
+                    del users_data[user_id]
+    
+    # بدء الخيط في الخلفية
+    cleanup_thread = threading.Thread(target=cleanup_sessions, daemon=True)
+    cleanup_thread.start()
 
+# ====== الدالة الرئيسية ======
 def main():
     """الدالة الرئيسية لتشغيل البوت"""
     # إنشاء التطبيق
@@ -1959,21 +1365,24 @@ def main():
     conv_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^start_pressed$")],
         states={
-            USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_username)],
-            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_password)],
+            USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)],
+            PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)]
         },
         fallbacks=[],
+        per_message=False
     )
     application.add_handler(conv_handler)
     
     # إضافة معالج الأزرار
     application.add_handler(CallbackQueryHandler(button_handler))
     
+    # إضافة معالج الرسائل العامة
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
     # إضافة دالة البدء
-    application.job_queue.run_once(lambda context: on_start(application), when=0)
+    application.job_queue.run_once(on_start, when=1)
     
     # بدء البوت
-    logger.info("🚀 جاري بدء تشغيل البوت...")
     application.run_polling()
 
 if __name__ == "__main__":
